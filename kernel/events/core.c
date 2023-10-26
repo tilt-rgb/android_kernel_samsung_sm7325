@@ -1870,8 +1870,9 @@ static void perf_group_attach(struct perf_event *event)
 
 	list_add_tail(&event->sibling_list, &group_leader->sibling_list);
 	group_leader->nr_siblings++;
+        group_leader->group_generation++;
 
-	perf_event__header_size(group_leader);
+        perf_event__header_size(group_leader);
 
 	for_each_sibling_event(pos, group_leader)
 		perf_event__header_size(pos);
@@ -2025,6 +2026,7 @@ static void perf_group_detach(struct perf_event *event)
 	if (event->group_leader != event) {
 		list_del_init(&event->sibling_list);
 		event->group_leader->nr_siblings--;
+                event->group_leader->group_generation++;
 #ifdef CONFIG_PERF_KERNEL_SHARE
 		if (event->shared)
 			event->group_leader = event;
@@ -4911,7 +4913,8 @@ static u64 __perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *
 u64 perf_event_read_value(struct perf_event *event, u64 *enabled, u64 *running)
 {
 	struct perf_event_context *ctx;
-	u64 count;
+	struct perf_event *sub, *parent;
+        u64 count;
 
 	ctx = perf_event_ctx_lock(event);
 	count = __perf_event_read_value(event, enabled, running);
@@ -4935,6 +4938,33 @@ static int __perf_read_group_add(struct perf_event *leader,
 		return ret;
 
 	raw_spin_lock_irqsave(&ctx->lock, flags);
+        
+       /*
+	 * Verify the grouping between the parent and child (inherited)
+	 * events is still in tact.
+	 *
+	 * Specifically:
+	 *  - leader->ctx->lock pins leader->sibling_list
+	 *  - parent->child_mutex pins parent->child_list
+	 *  - parent->ctx->mutex pins parent->sibling_list
+	 *
+	 * Because parent->ctx != leader->ctx (and child_list nests inside
+	 * ctx->mutex), group destruction is not atomic between children, also
+	 * see perf_event_release_kernel(). Additionally, parent can grow the
+	 * group.
+	 *
+	 * Therefore it is possible to have parent and child groups in a
+	 * different configuration and summing over such a beast makes no sense
+	 * what so ever.
+	 *
+	 * Reject this.
+	 */
+	parent = leader->parent;
+	if (parent &&
+	    (parent->group_generation != leader->group_generation ||
+	     parent->nr_siblings != leader->nr_siblings)) {
+		ret = -ECHILD;
+		goto unlock;
 
 	/*
 	 * Since we co-schedule groups, {enabled,running} times of siblings
@@ -4963,9 +4993,9 @@ static int __perf_read_group_add(struct perf_event *leader,
 		if (read_format & PERF_FORMAT_ID)
 			values[n++] = primary_event_id(sub);
 	}
-
+unlock:
 	raw_spin_unlock_irqrestore(&ctx->lock, flags);
-	return 0;
+	return ret;
 }
 
 static int perf_read_group(struct perf_event *event,
@@ -4982,12 +5012,7 @@ static int perf_read_group(struct perf_event *event,
 	if (!values)
 		return -ENOMEM;
 
-	values[0] = 1 + leader->nr_siblings;
-
-	/*
-	 * By locking the child_mutex of the leader we effectively
-	 * lock the child list of all siblings.. XXX explain how.
-	 */
+	values[0] = 1 + leader->nr_siblings
 	mutex_lock(&leader->child_mutex);
 
 	ret = __perf_read_group_add(leader, read_format, values);
@@ -12288,6 +12313,7 @@ static int inherit_group(struct perf_event *parent_event,
 		    !perf_get_aux_event(child_ctr, leader))
 			return -EINVAL;
 	}
+        leader->group_generation = parent_event->group_generation
 	return 0;
 }
 
